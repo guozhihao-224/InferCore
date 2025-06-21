@@ -1,9 +1,9 @@
 use crate::tensor::{device::Device, dtype::DType};
-use ndarray::{ArrayD, Ix2, IxDyn};
+use ndarray::{ArrayD, Axis, Ix2, IxDyn};
 
 #[derive(Debug, Clone)]
 pub struct Tensor {
-    pub data: ArrayD<f32>, // 先用 f32，后续可泛型化
+    pub data: ArrayD<f32>, // TODO 后续进行泛化
     pub dtype: DType,
     pub device: Device,
     pub shape: Vec<usize>, // 冗余存储，便于快速访问
@@ -181,11 +181,67 @@ impl Tensor {
             shape: new_shape,
         }
     }
+
+    /// 将张量除以一个标量
+    pub fn div_scalar(&self, scalar: f32) -> Tensor {
+        Tensor {
+            data: &self.data / scalar,
+            dtype: self.dtype,
+            device: self.device,
+            shape: self.shape.clone(),
+        }
+    }
+
+    /// Softmax 归一化公式：
+    ///
+    ///     y_i = exp(x_i) / sum_j exp(x_j)
+    ///
+    /// 其中：
+    /// - x: 输入向量或张量在指定 axis 上的切片
+    /// - y: softmax 输出
+    /// - sum_j: 对 axis 维度上的所有元素求和
+    ///
+    /// 常用于将一组实数归一化为概率分布（如分类、注意力权重）。
+    pub fn softmax(&self, axis: isize) -> Tensor {
+        let axis = if axis < 0 {
+            (self.shape.len() as isize + axis) as usize
+        } else {
+            axis as usize
+        };
+        let data = self.data.clone();
+
+        // Compute max along axis, keep dims for broadcasting
+        // 如果 x_i 很大，那么 e^(x_i) 会迅速溢出（变成无穷大，导致NaN）
+        // 为防止这种情况，常用trick是先减去最大值
+        let max = data
+            .map_axis(Axis(axis), |row| {
+                row.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            })
+            .insert_axis(Axis(axis));
+        
+        // 3. 每个元素减去最大值后取指数, max会自动广播
+        let exp = (&data - &max).mapv(f32::exp);
+
+        // 4. 计算每个“行”的指数和，保持维度用于广播
+        let sum = exp.sum_axis(Axis(axis)).insert_axis(Axis(axis));
+
+        // 5. 每个元素除以该行的指数和， sum会自动广播
+        let softmax = &exp / &sum;
+
+        Tensor {
+            data: softmax,
+            dtype: self.dtype,
+            device: self.device,
+            shape: self.shape.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::device::Device;
+
     #[test]
     fn test_zeros() {
         let t = Tensor::zeros(&[2, 3], Device::Cpu);
@@ -247,5 +303,110 @@ mod tests {
         assert_eq!(t2.shape(), &[3, 2]);
         let t3 = t2.transpose(&[1, 0]);
         assert_eq!(t3.shape(), &[2, 3]);
+    }
+
+    #[test]
+    fn test_div_scalar() {
+        let t = Tensor::from_vec(vec![2.0, 4.0, 6.0, 8.0], &[2, 2], Device::Cpu);
+        let t2 = t.div_scalar(2.0);
+        assert_eq!(t2.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_softmax_last_axis() {
+        let t = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2], Device::Cpu);
+        let t2 = t.softmax(-1);
+        // 计算 softmax
+        let s1 = (1.0f32).exp() + (2.0f32).exp();
+        let s2 = (3.0f32).exp() + (4.0f32).exp();
+        let expected = vec![
+            (1.0f32).exp() / s1,
+            (2.0f32).exp() / s1,
+            (3.0f32).exp() / s2,
+            (4.0f32).exp() / s2,
+        ];
+        for (a, b) in t2.to_vec().iter().zip(expected.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "softmax output: {}, expected: {}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_softmax_axis0() {
+        let t = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2], Device::Cpu);
+        let t2 = t.softmax(0);
+        // 计算 softmax
+        let s1 = (1.0f32).exp() + (3.0f32).exp();
+        let s2 = (2.0f32).exp() + (4.0f32).exp();
+        let expected = vec![
+            (1.0f32).exp() / s1,
+            (2.0f32).exp() / s2,
+            (3.0f32).exp() / s1,
+            (4.0f32).exp() / s2,
+        ];
+        for (a, b) in t2.to_vec().iter().zip(expected.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "softmax output: {}, expected: {}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_softmax_2d_axis1() {
+        // 2D tensor, softmax along axis 1
+        let t = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], Device::Cpu);
+        let t2 = t.softmax(1);
+        // Row 1: [1,2,3], Row 2: [4,5,6]
+        let s1 = (1.0f32).exp() + (2.0f32).exp() + (3.0f32).exp();
+        let s2 = (4.0f32).exp() + (5.0f32).exp() + (6.0f32).exp();
+        let expected = vec![
+            (1.0f32).exp() / s1,
+            (2.0f32).exp() / s1,
+            (3.0f32).exp() / s1,
+            (4.0f32).exp() / s2,
+            (5.0f32).exp() / s2,
+            (6.0f32).exp() / s2,
+        ];
+        for (a, b) in t2.to_vec().iter().zip(expected.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "softmax output: {}, expected: {}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_softmax_3d_axis2() {
+        // 3D tensor, softmax along axis 2
+        let t = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 2, 3], Device::Cpu);
+        let t2 = t.softmax(2);
+        // For each [i, j, :] do softmax
+        let s1 = (1.0f32).exp() + (2.0f32).exp() + (3.0f32).exp();
+        let s2 = (4.0f32).exp() + (5.0f32).exp() + (6.0f32).exp();
+        let expected = vec![
+            (1.0f32).exp() / s1,
+            (2.0f32).exp() / s1,
+            (3.0f32).exp() / s1,
+            (4.0f32).exp() / s2,
+            (5.0f32).exp() / s2,
+            (6.0f32).exp() / s2,
+        ];
+        for (a, b) in t2.to_vec().iter().zip(expected.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "softmax output: {}, expected: {}",
+                a,
+                b
+            );
+        }
     }
 }
