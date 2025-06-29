@@ -1,8 +1,9 @@
-use crate::tokenizer::error::TokenizerSnafu;
 use snafu::ResultExt;
-use tokenizers::{Tokenizer, models::bpe::BPE};
+use tokenizers::models::bpe::BPE;
+use tokenizers::Tokenizer;
 
 use super::error::Result;
+use crate::tokenizer::error::TokenizerSnafu;
 
 #[derive(Debug, Clone)]
 pub struct QwenTokenizer {

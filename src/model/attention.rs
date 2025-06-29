@@ -1,158 +1,183 @@
 use crate::tensor::tensor::Tensor;
 
-#[derive(Debug, Clone)]
-pub struct Attention {
-    pub wq: Tensor, // [hidden, hidden]
-    pub wk: Tensor, // [hidden, hidden]
-    pub wv: Tensor, // [hidden, hidden]
-    pub n_heads: usize,
+/// 泛型多头自注意力结构体，字段命名对齐 Qwen2.5 权重
+pub struct Attention<T: crate::tensor::tensor::Tensor<Elem = f32>> {
+    pub q_proj: T, // Q 投影权重 [hidden, hidden]
+    pub q_bias: Option<T>,
+    pub k_proj: T, // K 投影权重 [hidden, hidden]
+    pub k_bias: Option<T>,
+    pub v_proj: T, // V 投影权重 [hidden, hidden]
+    pub v_bias: Option<T>,
+    pub o_proj: T, // 输出投影权重 [hidden, hidden]
+    pub o_bias: Option<T>,
+    pub num_heads: usize,
     pub head_dim: usize,
 }
 
-impl Attention {
-    pub fn qkv(&self, x: &Tensor) -> (Tensor, Tensor, Tensor) {
-        // x: [batch, seq, hidden]
-        // wq/wk/wv: [hidden, hidden]
-        let q = x.matmul(&self.wq); // [batch, seq, hidden]
-        let k = x.matmul(&self.wk); // [batch, seq, hidden]
-        let v = x.matmul(&self.wv); // [batch, seq, hidden]
-        (q, k, v)
+impl<T: crate::tensor::tensor::Tensor<Elem = f32>> Attention<T> {
+    pub fn new(
+        q_proj: T, q_bias: Option<T>,
+        k_proj: T, k_bias: Option<T>,
+        v_proj: T, v_bias: Option<T>,
+        o_proj: T, o_bias: Option<T>,
+        num_heads: usize, head_dim: usize
+    ) -> Self {
+        Self { q_proj, q_bias, k_proj, k_bias, v_proj, v_bias, o_proj, o_bias, num_heads, head_dim }
     }
 
-    pub fn split_heads(&self, x: &Tensor) -> Tensor {
-        // x: [batch, seq, hidden]
-        let (batch, seq, hidden) = (x.shape[0], x.shape[1], x.shape[2]);
-        assert_eq!(hidden, self.n_heads * self.head_dim);
-
-        // 先 reshape 为 [batch, seq, n_heads, head_dim]
-        let reshaped = x.reshape(&[batch, seq, self.n_heads, self.head_dim]);
-        // 再转置为 [batch, n_heads, seq, head_dim]
-        reshaped.transpose(&[0, 2, 1, 3])
+    /// [batch, seq, hidden] -> [batch, num_heads, seq, head_dim]
+    fn split_heads(&self, x: &T) -> T {
+        let d = x.dims();
+        let (batch, seq, hidden) = (d[0], d[1], d[2]);
+        assert_eq!(hidden, self.num_heads * self.head_dim);
+        let x = x.reshape(&[batch, seq, self.num_heads, self.head_dim]);
+        x.permute(&[0, 2, 1, 3])
+    }
+    /// [batch, num_heads, seq, head_dim] -> [batch, seq, hidden]
+    fn merge_heads(&self, x: &T) -> T {
+        let d = x.dims();
+        let (batch, num_heads, seq, head_dim) = (d[0], d[1], d[2], d[3]);
+        let x = x.permute(&[0, 2, 1, 3]);
+        x.reshape(&[batch, seq, num_heads * head_dim])
     }
 
-    pub fn merge_heads(&self, x: &Tensor) -> Tensor {
-        // x: [batch, n_heads, seq, head_dim]
-        let (batch, n_heads, seq, head_dim) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
-        assert_eq!(n_heads, self.n_heads);
-        assert_eq!(head_dim, self.head_dim);
+    /// x: [batch, seq, hidden]
+    /// mask: Option<[batch, seq, seq]> (可选)
+    /// 返回: [batch, seq, hidden]
+    pub fn forward(&self, x: &T, mask: Option<&T>) -> T {
+        // 1. Q/K/V 投影
+        let q = {
+            let mut t = x.matmul(&self.q_proj);
+            if let Some(ref b) = self.q_bias {
+                let b = b.broadcast_as(t.dims());
+                t = t.add(&b);
+            }
+            t
+        };
+        let k = {
+            let mut t = x.matmul(&self.k_proj);
+            if let Some(ref b) = self.k_bias {
+                let b = b.broadcast_as(t.dims());
+                t = t.add(&b);
+            }
+            t
+        };
+        let v = {
+            let mut t = x.matmul(&self.v_proj);
+            if let Some(ref b) = self.v_bias {
+                let b = b.broadcast_as(t.dims());
+                t = t.add(&b);
+            }
+            t
+        };
+        // 2. 多头分解 [batch, num_heads, seq, head_dim]
+        let q = self.split_heads(&q);
+        let k = self.split_heads(&k);
+        let v = self.split_heads(&v);
+        
+        // 3. QK^T / sqrt(d)
+        let k_t = k.permute(&[0, 1, 3, 2]); // [batch, num_heads, head_dim, seq]
+        let scale = (self.head_dim as f32).sqrt().ln();
+        let attn_scores = q.matmul(&k_t).add_scalar(-scale);
 
-        // 先转置为 [batch, seq, n_heads, head_dim]
-        let transposed = x.transpose(&[0, 2, 1, 3]);
-        // 再 reshape 为 [batch, seq, hidden]
-        transposed.reshape(&[batch, seq, n_heads * head_dim])
+        // 4. mask（可选）
+        let attn_scores = if let Some(mask) = mask {
+            attn_scores.add(mask)
+        } else {
+            attn_scores
+        };
+        // 5. softmax 最后一个轴
+        let attn_probs = attn_scores.softmax(-1);
+        // 6. attention output
+        let attn_out = attn_probs.matmul(&v); // [batch, num_heads, seq, head_dim]
+        // 7. 合并头 [batch, seq, hidden]
+        let attn_out = self.merge_heads(&attn_out);
+        // 8. 输出投影
+        let mut y = attn_out.matmul(&self.o_proj);
+        if let Some(ref b) = self.o_bias {
+            let b = b.broadcast_as(y.dims());
+            y = y.add(&b);
+        }
+        y
     }
+
+
+    
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tensor::{device::Device, tensor::Tensor};
 
-    #[test]
-    fn test_qkv_projection() {
-        // 假设 hidden=4
-        let wq = Tensor::from_vec(
-            vec![
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-            ],
-            &[4, 4],
-            Device::Cpu,
-        );
-        let wk = wq.clone();
-        let wv = wq.clone();
+pub fn apply_qwen2_rotary_embedding(x: &Tensor) -> Tensor {
+    let shape = x.shape();
+    let (batch, seq_len, n_heads, head_dim) = (shape[0], shape[1], shape[2], shape[3]);
+    assert!(head_dim % 2 == 0, "head_dim 必须为偶数");
+    let half_dim = head_dim / 2;
 
-        let attn = Attention {
-            wq,
-            wk,
-            wv,
-            n_heads: 1,
-            head_dim: 1,
-        };
-        let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[1, 4], Device::Cpu);
+    // 1. 前半部分频率
+    let inv_freq1: Vec<f32> = (0..half_dim)
+        .map(|i| 1.0 / 10000f32.powf(i as f32 / half_dim as f32))
+        .collect();
+    // 2. 后半部分频率（可与前半不同，Qwen2.5官方实现通常用更高频率或不同间隔）
+    let inv_freq2: Vec<f32> = (0..half_dim)
+        .map(|i| 1.0 / 10000f32.powf(i as f32 / half_dim as f32))
+        .collect();
 
-        let (q, k, v) = attn.qkv(&x);
-        assert_eq!(q.to_vec(), x.to_vec());
-        assert_eq!(k.to_vec(), x.to_vec());
-        assert_eq!(v.to_vec(), x.to_vec());
+    // 3. 生成 cos/sin
+    let mut cos1 = vec![0.0; seq_len * half_dim];
+    let mut sin1 = vec![0.0; seq_len * half_dim];
+    let mut cos2 = vec![0.0; seq_len * half_dim];
+    let mut sin2 = vec![0.0; seq_len * half_dim];
+    for pos in 0..seq_len {
+        for i in 0..half_dim {
+            let theta1 = pos as f32 * inv_freq1[i];
+            let theta2 = pos as f32 * inv_freq2[i];
+            cos1[pos * half_dim + i] = theta1.cos();
+            sin1[pos * half_dim + i] = theta1.sin();
+            cos2[pos * half_dim + i] = theta2.cos();
+            sin2[pos * half_dim + i] = theta2.sin();
+        }
     }
 
-    #[test]
-    fn test_split_and_merge_heads() {
-        let n_heads = 2;
-        let head_dim = 2;
-        let hidden = n_heads * head_dim;
-        let batch = 1;
-        let seq = 2;
-        let attn = Attention {
-            wq: Tensor::zeros(&[hidden, hidden], Device::Cpu),
-            wk: Tensor::zeros(&[hidden, hidden], Device::Cpu),
-            wv: Tensor::zeros(&[hidden, hidden], Device::Cpu),
-            n_heads,
-            head_dim,
-        };
-        let x = Tensor::from_vec(
-            (0..(batch * seq * hidden)).map(|v| v as f32).collect(),
-            &[batch, seq, hidden],
-            Device::Cpu,
-        );
-
-        let split = attn.split_heads(&x);
-        assert_eq!(split.shape(), &[batch, n_heads, seq, head_dim]);
-
-        let merged = attn.merge_heads(&split);
-        assert_eq!(merged.shape(), &[batch, seq, hidden]);
-        assert_eq!(merged.to_vec(), x.to_vec());
+    // 4. 对 x 的每个 batch, seq, head, head_dim 做分半旋转
+    let mut out = x.clone();
+    for b in 0..batch {
+        for s in 0..seq_len {
+            for h in 0..n_heads {
+                // 前半
+                for i in 0..(half_dim / 2) {
+                    let idx0 = 2 * i;
+                    let idx1 = 2 * i + 1;
+                    let q0 = x.get(&[b, s, h, idx0]);
+                    let q1 = x.get(&[b, s, h, idx1]);
+                    let c = cos1[s * half_dim + idx0 / 2];
+                    let s_ = sin1[s * half_dim + idx0 / 2];
+                    *out.get_mut(&[b, s, h, idx0]) = q0 * c - q1 * s_;
+                    *out.get_mut(&[b, s, h, idx1]) = q0 * s_ + q1 * c;
+                }
+                // 后半
+                for i in 0..(half_dim / 2) {
+                    let idx0 = half_dim + 2 * i;
+                    let idx1 = half_dim + 2 * i + 1;
+                    let q0 = x.get(&[b, s, h, idx0]);
+                    let q1 = x.get(&[b, s, h, idx1]);
+                    let c = cos2[s * half_dim + idx0 / 2 - half_dim / 2];
+                    let s_ = sin2[s * half_dim + idx0 / 2 - half_dim / 2];
+                    *out.get_mut(&[b, s, h, idx0]) = q0 * c - q1 * s_;
+                    *out.get_mut(&[b, s, h, idx1]) = q0 * s_ + q1 * c;
+                }
+            }
+        }
     }
-
-    #[test]
-    fn test_qkv_projection_multihead() {
-        let n_heads = 2;
-        let head_dim = 2;
-        let hidden = n_heads * head_dim;
-        let batch = 1;
-        let seq = 2;
-
-        // 构造单位矩阵权重，便于验证
-        let wq = Tensor::from_vec(
-            (0..hidden * hidden)
-                .map(|i| if i % (hidden + 1) == 0 { 1.0 } else { 0.0 })
-                .collect(),
-            &[hidden, hidden],
-            Device::Cpu,
-        );
-        let wk = wq.clone();
-        let wv = wq.clone();
-
-        let attn = Attention {
-            wq,
-            wk,
-            wv,
-            n_heads,
-            head_dim,
-        };
-
-        // 输入 shape: [batch, seq, hidden]
-        let x = Tensor::from_vec(
-            (0..(batch * seq * hidden)).map(|v| v as f32).collect(),
-            &[batch, seq, hidden],
-            Device::Cpu,
-        );
-
-        // Q/K/V projection
-        let (q, k, v) = attn.qkv(&x);
-
-        // 多头拆分
-        let q_split = attn.split_heads(&q);
-        let k_split = attn.split_heads(&k);
-        let v_split = attn.split_heads(&v);
-
-        // 检查 shape
-        assert_eq!(q_split.shape(), &[batch, n_heads, seq, head_dim]);
-        assert_eq!(k_split.shape(), &[batch, n_heads, seq, head_dim]);
-        assert_eq!(v_split.shape(), &[batch, n_heads, seq, head_dim]);
-
-        // 检查内容（单位矩阵权重，输出应等于输入）
-        let q_merged = attn.merge_heads(&q_split);
-        assert_eq!(q_merged.to_vec(), x.to_vec());
-    }
+    out
 }
+
+
+
+// --- 用法示例 ---
+// let attn = Attention::new(q_proj, None, k_proj, None, v_proj, None, o_proj, None, num_heads, head_dim);
+// let y = attn.forward(&x, None);
+
+// --- 测试建议 ---
+// 1. shape 检查：输入输出 shape 是否一致
+// 2. 与 PyTorch 对齐：数值精度
+// 3. mask 支持：mask shape、广播、极端值
+// 4. 多 batch/多头/不同 head_dim

@@ -6,10 +6,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("tokenizers error"))]
-    Tokenizer {
+    #[snafu(display("mlp error"))]
+    MlpErr {
         #[snafu(source)]
-        error: tokenizers::Error,
+        error: candle_core::Error,
         #[snafu(implicit)]
         location: Location,
     },
