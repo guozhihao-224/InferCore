@@ -101,8 +101,6 @@ impl<T: crate::tensor::tensor::Tensor<Elem = f32>> Attention<T> {
         y
     }
 
-
-    
 }
 
 
